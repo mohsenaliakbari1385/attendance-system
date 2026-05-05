@@ -4,13 +4,24 @@ session_start();
 $db = new PDO("sqlite:attendance.db");
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
+// Load RBAC and Auth classes
+require_once 'api/rbac.php';
+require_once 'api/auth.php';
+
+$auth = new AuthHandler($db);
+
+// Create tables with enhanced schema for security
 $db->exec("
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fullname TEXT,
+    email TEXT UNIQUE,
     username TEXT UNIQUE,
     password TEXT,
-    role TEXT
+    role TEXT DEFAULT 'student',
+    is_verified INTEGER DEFAULT 0,
+    verification_token TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS classes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,66 +39,184 @@ CREATE TABLE IF NOT EXISTS attendance (
     status TEXT,
     attendance_date TEXT
 );
+CREATE TABLE IF NOT EXISTS security_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT,
+    details TEXT,
+    ip_address TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 ");
 
+// Migrate existing users to add missing columns if needed
+try {
+    $db->exec("ALTER TABLE users ADD COLUMN email TEXT UNIQUE");
+} catch (\Exception $e) {}
+
+try {
+    $db->exec("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1");
+} catch (\Exception $e) {}
+
+try {
+    $db->exec("ALTER TABLE users ADD COLUMN verification_token TEXT");
+} catch (\Exception $e) {}
+
+try {
+    $db->exec("ALTER TABLE users ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+} catch (\Exception $e) {}
+
+// Create default admin if not exists
 $checkAdmin = $db->query("SELECT COUNT(*) as total FROM users WHERE username='admin'")->fetch();
 if($checkAdmin['total'] == 0){
-    $password = md5("admin");
-    $stmt = $db->prepare("INSERT INTO users(fullname,username,password,role) VALUES(?,?,?,?)");
-    $stmt->execute(["Admin","admin",$password,"teacher"]);
+    $password = password_hash("admin", PASSWORD_BCRYPT);
+    $stmt = $db->prepare("INSERT INTO users(fullname, email, username, password, role, is_verified, created_at) VALUES(?,?,?,?,?,?,?)");
+    $stmt->execute(["Admin", "admin@localhost", "admin", $password, "teacher", 1, date('Y-m-d H:i:s')]);
 }
 
+// HANDLE LOGIN
 if(isset($_POST['login'])){
-    $username = $_POST['username'];
-    $password = md5($_POST['password']);
-    $stmt = $db->prepare("SELECT * FROM users WHERE username=? AND password=?");
-    $stmt->execute([$username,$password]);
-    $user = $stmt->fetch();
-    if($user){ $_SESSION['user'] = $user; header("Location:index.php"); exit; }
-    else { $error = "نام کاربری یا رمز عبور اشتباه است"; }
+    $username = $_POST['username'] ?? '';
+    $password = $_POST['password'] ?? '';
+    $result = $auth->login($username, $password);
+    
+    if($result['success']){
+        $_SESSION['user'] = $result['user'];
+        RBAC::logSecurityEvent('LOGIN_SUCCESS', "User: {$username}");
+        header("Location:index.php");
+        exit;
+    } else {
+        $error = $result['message'];
+        RBAC::logSecurityEvent('LOGIN_FAILED', "Username: {$username}");
+    }
 }
 
-if(isset($_GET['logout'])){ session_destroy(); header("Location:index.php"); exit; }
+// HANDLE LOGOUT
+if(isset($_GET['logout'])){
+    RBAC::logSecurityEvent('LOGOUT', "User: " . ($_SESSION['user']['username'] ?? 'unknown'));
+    session_destroy();
+    header("Location:index.php");
+    exit;
+}
 
+// HANDLE CREATE STUDENT (TEACHER ONLY)
 if(isset($_POST['create_student'])){
-    $stmt = $db->prepare("INSERT INTO users(fullname,username,password,role) VALUES(?,?,?,?)");
-    $stmt->execute([$_POST['fullname'],$_POST['username'],md5($_POST['password']),"student"]);
-    $success = "دانش‌آموز با موفقیت ایجاد شد";
+    if(!RBAC::isTeacher()){
+        $error = "شما اجازه ایجاد دانش‌آموز را ندارید";
+    } else {
+        $fullname = $_POST['fullname'] ?? '';
+        $username = $_POST['username'] ?? '';
+        $password = $_POST['password'] ?? '';
+        
+        if(empty($fullname) || empty($username) || empty($password)){
+            $error = "تمام فیلدها الزامی هستند";
+        } else {
+            try {
+                $passwordHash = password_hash($password, PASSWORD_BCRYPT);
+                $stmt = $db->prepare("INSERT INTO users(fullname, username, password, role, is_verified, created_at) VALUES(?,?,?,?,?,?)");
+                $stmt->execute([$fullname, $username, $passwordHash, "student", 1, date('Y-m-d H:i:s')]);
+                $success = "دانش‌آموز با موفقیت ایجاد شد";
+                RBAC::logSecurityEvent('CREATE_STUDENT', "Student: {$username}");
+            } catch (\Exception $e) {
+                $error = "خطا: " . $e->getMessage();
+            }
+        }
+    }
 }
 
+// HANDLE CREATE CLASS (TEACHER ONLY)
 if(isset($_POST['create_class'])){
-    $stmt = $db->prepare("INSERT INTO classes(class_name) VALUES(?)");
-    $stmt->execute([$_POST['class_name']]);
-    $success = "کلاس با موفقیت ایجاد شد";
+    if(!RBAC::isTeacher()){
+        $error = "شما اجازه ایجاد کلاس را ندارید";
+    } else {
+        $class_name = $_POST['class_name'] ?? '';
+        if(empty($class_name)){
+            $error = "نام کلاس الزامی است";
+        } else {
+            try {
+                $stmt = $db->prepare("INSERT INTO classes(class_name) VALUES(?)");
+                $stmt->execute([$class_name]);
+                $success = "کلاس با موفقیت ایجاد شد";
+                RBAC::logSecurityEvent('CREATE_CLASS', "Class: {$class_name}");
+            } catch (\Exception $e) {
+                $error = "خطا: " . $e->getMessage();
+            }
+        }
+    }
 }
 
+// HANDLE CREATE COURSE (TEACHER ONLY)
 if(isset($_POST['create_course'])){
-    $stmt = $db->prepare("INSERT INTO courses(course_name,class_id) VALUES(?,?)");
-    $stmt->execute([$_POST['course_name'],$_POST['class_id']]);
-    $success = "درس با موفقیت ایجاد شد";
+    if(!RBAC::isTeacher()){
+        $error = "شما اجازه ایجاد درس را ندارید";
+    } else {
+        $course_name = $_POST['course_name'] ?? '';
+        $class_id = $_POST['class_id'] ?? '';
+        if(empty($course_name) || empty($class_id)){
+            $error = "تمام فیلدها الزامی هستند";
+        } else {
+            try {
+                $stmt = $db->prepare("INSERT INTO courses(course_name, class_id) VALUES(?,?)");
+                $stmt->execute([$course_name, $class_id]);
+                $success = "درس با موفقیت ایجاد شد";
+                RBAC::logSecurityEvent('CREATE_COURSE', "Course: {$course_name}");
+            } catch (\Exception $e) {
+                $error = "خطا: " . $e->getMessage();
+            }
+        }
+    }
 }
 
+// HANDLE MARK ATTENDANCE (STUDENTS ONLY - RBAC ENFORCED)
 if(isset($_POST['mark_attendance'])){
-    $student_id = $_SESSION['user']['id'];
-    $course_id = $_POST['course_id'];
-    $date = date("Y-m-d");
-    $check = $db->prepare("SELECT * FROM attendance WHERE student_id=? AND course_id=? AND attendance_date=?");
-    $check->execute([$student_id,$course_id,$date]);
-    if(!$check->fetch()){
-        $stmt = $db->prepare("INSERT INTO attendance(student_id,course_id,status,attendance_date) VALUES(?,?,?,?)");
-        $stmt->execute([$student_id,$course_id,"Present",$date]);
-        $success = "حضور شما با موفقیت ثبت شد";
-    } else { $error = "حضور شما امروز قبلاً ثبت شده است"; }
+    if(!RBAC::isStudent()){
+        $error = "دانش‌آموزان فقط می‌توانند حضور خود را ثبت کنند";
+    } else {
+        $student_id = RBAC::getCurrentUserId();
+        $course_id = $_POST['course_id'] ?? '';
+        $date = date("Y-m-d");
+        
+        if(empty($course_id)){
+            $error = "درس انتخاب الزامی است";
+        } else {
+            try {
+                // RBAC: Student can only mark their own attendance
+                if(!RBAC::canMarkAttendance($student_id)){
+                    $error = "شما فقط می‌توانید حضور خود را ثبت کنید";
+                } else {
+                    $check = $db->prepare("SELECT * FROM attendance WHERE student_id=? AND course_id=? AND attendance_date=?");
+                    $check->execute([$student_id, $course_id, $date]);
+                    if(!$check->fetch()){
+                        $stmt = $db->prepare("INSERT INTO attendance(student_id, course_id, status, attendance_date) VALUES(?,?,?,?)");
+                        $stmt->execute([$student_id, $course_id, "Present", $date]);
+                        $success = "حضور شما با موفقیت ثبت شد";
+                        RBAC::logSecurityEvent('MARK_ATTENDANCE', "Course: {$course_id}");
+                    } else {
+                        $error = "حضور شما امروز قبلاً ثبت شده است";
+                    }
+                }
+            } catch (\Exception $e) {
+                $error = "خطا: " . $e->getMessage();
+            }
+        }
+    }
 }
 
+// HANDLE EXPORT (TEACHER ONLY)
 if(isset($_GET['export'])){
+    if(!RBAC::canExportData()){
+        die("دسترسی رد شد");
+    }
+    
     header('Content-Type:text/csv');
     header('Content-Disposition:attachment; filename=attendance.csv');
     $output = fopen("php://output","w");
     fputcsv($output,['Student','Course','Status','Date']);
     $result = $db->query("SELECT users.fullname,courses.course_name,attendance.status,attendance.attendance_date FROM attendance JOIN users ON attendance.student_id=users.id JOIN courses ON attendance.course_id=courses.id");
     while($row = $result->fetch(PDO::FETCH_ASSOC)){ fputcsv($output,$row); }
-    fclose($output); exit;
+    fclose($output);
+    RBAC::logSecurityEvent('EXPORT_DATA', "Attendance report exported");
+    exit;
 }
 ?>
 <!DOCTYPE html>
@@ -602,7 +731,7 @@ tbody td {
         <p class="login-subtitle">برای ادامه وارد حساب کاربری خود شوید</p>
 
         <?php if(isset($error)): ?>
-        <div class="alert alert-danger">⚠️ <?= $error ?></div>
+        <div class="alert alert-danger">⚠️ <?= htmlspecialchars($error) ?></div>
         <?php endif; ?>
 
         <form method="POST">
@@ -617,7 +746,10 @@ tbody td {
             <button class="btn btn-primary btn-full" name="login" style="margin-top: 0.5rem;">ورود به سیستم</button>
         </form>
 
-        <div class="hint-box">
+        <div class="hint-box" style="text-align: center;">
+            <strong style="color: var(--accent2);">معلم جدید؟</strong><br>
+            <a href="register.php" style="color: var(--accent); text-decoration: none;">اینجا ثبت‌نام کنید</a>
+            <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 0.75rem 0;">
             <strong style="color: var(--accent2);">اطلاعات پیش‌فرض ادمین:</strong><br>
             نام کاربری: <span>admin</span> &nbsp;|&nbsp; رمز عبور: <span>admin</span>
         </div>
@@ -792,12 +924,14 @@ tbody td {
     <div class="dash-header animate">
         <div class="dash-welcome">
             پنل دانش‌آموز
-            <small>ثبت حضور و مشاهده سابقه</small>
+            <small>ثبت حضور و مشاهده سابقه شخصی</small>
         </div>
     </div>
 
     <?php
-    $student_id = $_SESSION['user']['id'];
+    // RBAC: Students can only access their own data
+    $student_id = RBAC::getCurrentUserId();
+    
     $myTotal = $db->prepare("SELECT COUNT(*) FROM attendance WHERE student_id=?");
     $myTotal->execute([$student_id]);
     $myCount = $myTotal->fetchColumn();
@@ -854,6 +988,7 @@ tbody td {
                 </thead>
                 <tbody>
                 <?php
+                // RBAC: Only fetch the current student's attendance
                 $query = $db->prepare("
                     SELECT courses.course_name, attendance.status, attendance.attendance_date
                     FROM attendance
